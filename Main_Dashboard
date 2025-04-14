@@ -1,0 +1,261 @@
+import gradio as gr
+import pandas as pd
+import matplotlib.pyplot as plt
+import io
+import base64
+import numpy as np
+import plotly.express as px
+from matplotlib import rcParams
+import openai
+openai.api_key = 'Your Api key'
+
+def gpt_summaries(text):
+    response = openai.ChatCompletion.create(
+        model='gpt-4o-mini', 
+        messages=[
+            {"role": "system", "content": "你是一位聰明、具備豐富的金融知識並且懂得解析文章內容的主編，請使用繁體中文回覆以下問題。"},
+            {"role": "user", "content": f"內容：{text}"},
+            {"role": "assistant", "content": "請根據內容的重要性，準確整合出50字內摘要。"}
+        ],
+        temperature=0.3,
+        top_p=1.0,
+    )
+    summary = response.choices[0].message['content'].strip()
+    print(summary)
+    return summary
+# 設定中文顯示
+rcParams['font.sans-serif'] = ['Microsoft YaHei']  # 或者使用 'SimHei'
+rcParams['axes.unicode_minus'] = False            # 防止負號顯示為方塊
+
+def generate_chart(csv_file, start_date, end_date):
+    try:
+        # 讀取 CSV
+        df = pd.read_csv(csv_file.name, encoding='utf-8-sig')
+        if "Month" not in df.columns:
+            return "無 'Month' 欄位, 無法篩選日期", None
+        
+        # 篩選日期
+        df['Month'] = pd.to_datetime(df['Month'], errors='coerce')
+        filtered_df = df[
+            (df['Month'] >= pd.to_datetime(start_date)) &
+            (df['Month'] <= pd.to_datetime(end_date))
+        ]
+
+        # [1] 生成圓餅圖（Matplotlib -> Base64 -> HTML）
+        News_Source_combined_d = filtered_df['Sources'].value_counts()
+        mask = News_Source_combined_d < 2
+        others_count = News_Source_combined_d[mask].sum()
+        new_counts = News_Source_combined_d[~mask].copy()
+        new_counts['其他'] = others_count
+
+        def autopct_with_count(pct):
+            total = sum(new_counts)
+            count = int(round(pct * total / 100.0))
+            return f'{pct:.1f}%\n({count:d})'
+
+        plt.figure(figsize=(10, 10))
+        plt.pie(
+            new_counts, 
+            labels=new_counts.index, 
+            autopct=autopct_with_count,
+            startangle=140,
+            textprops={'fontsize': 14, 'fontweight': 'bold'},
+            pctdistance=0.8
+        )
+        plt.axis('equal')
+        pie_img_io = io.BytesIO()
+        plt.savefig(pie_img_io, format='png')
+        pie_img_io.seek(0)
+        pie_b64 = base64.b64encode(pie_img_io.read()).decode('utf-8')
+        plt.close()
+        
+        pie_html = f"""
+        <div style="width:90%; height:90%; text-align:center;">
+          <img src="data:image/png;base64,{pie_b64}" style="max-width:100%; height:auto;" />
+        </div>
+        """
+
+# -----------------------------
+        # 生成互動式散布圖 (Plotly)
+        x_vals = filtered_df['score_sentiment'].astype(float).values
+        y_vals = filtered_df['score_associate'].astype(float).values
+        jitter = 0.05
+        x_vals_jittered = x_vals + np.random.uniform(-jitter, jitter, size=len(x_vals))
+        y_vals_jittered = y_vals + np.random.uniform(-jitter, jitter, size=len(y_vals))
+        
+        scatter_df = filtered_df.copy()
+        scatter_df['x_vals_jittered'] = x_vals_jittered
+        scatter_df['y_vals_jittered'] = y_vals_jittered
+        
+        # 設定象限分類 (Region)
+        scatter_df['Region'] = '未定義'
+        scatter_df.loc[(x_vals > 0) & (y_vals > 0), 'Region'] = '政策面正向聲量 (Q1)'
+        scatter_df.loc[(x_vals < 0) & (y_vals > 0), 'Region'] = '政策面負向聲量 (Q2)'
+        scatter_df.loc[(x_vals < 0) & (y_vals < 0), 'Region'] = '金融面負向聲量 (Q3)'
+        scatter_df.loc[(x_vals > 0) & (y_vals < 0), 'Region'] = '金融面正向聲量 (Q4)'
+        #color
+        region_colors = {
+            '政策面正向聲量 (Q1)': 'green',
+            '政策面負向聲量 (Q2)': 'red',
+            '金融面負向聲量 (Q3)': 'black',
+            '金融面正向聲量 (Q4)': 'blue',
+            '未定義': 'gray'
+        }
+
+        fig = px.scatter(
+            scatter_df,
+            x='x_vals_jittered',
+            y='y_vals_jittered',
+            color='Region',
+            color_discrete_map=region_colors,
+            hover_data=['Titles', 'Sources'],
+            labels={'x_vals_jittered': '情緒分數', 'y_vals_jittered': '領域面'},
+            title='新聞領域關聯性與情緒性散點圖'
+        )
+        # 增大 marker
+        # 添加水平線（y=0）
+        fig.add_shape(
+            type="line",
+            x0=-1.5, x1=1.5,
+            y0=0, y1=0,
+            xref="x", yref="y",
+            line=dict(color="black", width=2)
+        )
+        # 添加垂直線（x=0）
+        fig.add_shape(
+            type="line",
+            y0=-1.5, y1=1.5,
+            x0=0, x1=0,
+            xref="x", yref="y",
+            line=dict(color="black", width=2)
+        )
+        fig.update_yaxes(
+        tickvals=[-1, 0, 1],                   # 資料中對應 -1, 0, 1 的位置
+        ticktext=["金融面", "未明確", "政策面"]  # 對應顯示的文字
+        )
+        fig.update_traces(marker=dict(size=8))
+        fig.update_layout(plot_bgcolor='white', paper_bgcolor='white')
+        # 若你希望由 Plotly 自動決定軸範圍，可取消以下兩行的註解：
+        # fig.update_xaxes(range=[-1.5, 1.5])
+        # fig.update_yaxes(range=[-1.5, 1.5])
+        fig.show()
+        # 將 Plotly figure 轉為 HTML 字串 (保持互動性)
+        #=========================================================
+        #normal scatter
+        region_colors = {
+            '政策面正向聲量 (Q1)': 'green',
+            '政策面負向聲量 (Q2)': 'red',
+            '金融面負向聲量 (Q3)': 'black',
+            '金融面正向聲量 (Q4)': 'blue',
+        }
+        # colors = scatter_df['Region'].map(region_colors)
+        colors = scatter_df['Region'].map(region_colors).fillna('gray').tolist()
+        # 設定圖表
+        plt.figure(figsize=(18, 12))
+        # 使用 DataFrame 的正確欄位進行繪圖
+        plt.scatter(scatter_df['x_vals_jittered'], scatter_df['y_vals_jittered'], c=colors, s=200, alpha=0.5)
+        plt.xlim(-1.5, 1.5)
+        plt.ylim(-1.5, 1.5)
+        plt.axvline(x=0, color="black", linewidth=2)
+        plt.axhline(y=0, color="black", linewidth=2)
+        plt.yticks([-1, 0, 1], ["金融面", "未明確", "政策面"],fontsize=18, fontweight='bold')
+        plt.xlabel("新聞內容情緒分數",fontsize=18, fontweight='bold')
+        plt.ylabel("領域面",fontsize=18, fontweight='bold')
+        plt.title("新聞領域關聯性與情緒性散布圖 ",fontsize=18, fontweight='bold')
+ 
+        static_img_io = io.BytesIO()
+        plt.savefig(static_img_io, format="png")
+        static_img_io.seek(0)
+        static_scatter_b64 = base64.b64encode(static_img_io.read()).decode("utf-8")
+        plt.close()
+        scatter_html = f'<div style="width:105%; text-align:center; margin-top:50px;"><img src="data:image/png;base64,{static_scatter_b64}" style="max-width:100%; height:auto;"/></div>'
+        
+        # -----------------------------
+        # [2] 生成每月統計圖 (Bar Chart + Line Plot)
+        # 將 Month 格式化為 "YYYY-MM" 作為分組依據
+        filtered_df['Month_str'] = filtered_df['Month'].dt.strftime('%Y-%m')
+        filtered_df = filtered_df.sort_values(by='Month_str')
+        df_monthly = filtered_df.groupby('Month_str').agg(
+            positive_count = ('score_sentiment', lambda x: (x > 0).sum()),
+            negative_count = ('score_sentiment', lambda x: (x < 0).sum()),
+            Avg_Score_sentiment = ('score_sentiment', 'mean')
+        ).reset_index()
+        
+        plt.figure(figsize=(18, 12))
+        bar_width = 0.4
+        plt.bar(df_monthly['Month_str'], df_monthly['positive_count'], color='green', label='正向情緒數量', alpha=0.6, width=bar_width, align='center')
+        plt.bar(df_monthly['Month_str'], df_monthly['negative_count'], color='red', label='負向情緒數量', alpha=0.6, width=bar_width, align='edge')
+        plt.xlabel("月份", fontsize=18, fontweight='bold')
+        plt.ylabel("情緒數量", fontsize=18, fontweight='bold')
+        plt.title("每月新聞內容情緒數量與平均情緒分數", fontsize=20, fontweight='bold')
+        plt.xticks(rotation=45, ha='right', fontsize=16)
+        ax2 = plt.twinx()
+        ax2.plot(df_monthly['Month_str'], df_monthly['Avg_Score_sentiment'], color='blue', marker='o', markersize=8, label='平均情緒分數', linewidth=2)
+        ax2.set_ylabel("平均情緒分數", fontsize=18, fontweight='bold')
+        plt.legend(loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+        plt.tight_layout()
+        monthly_img_io = io.BytesIO()
+        plt.savefig(monthly_img_io, format='png')
+        monthly_img_io.seek(0)
+        monthly_b64 = base64.b64encode(monthly_img_io.read()).decode('utf-8')
+        plt.close()
+        monthly_html = f'<div style="width:100%; text-align:center; margin-top:50px;"><img src="data:image/png;base64,{monthly_b64}" style="max-width:100%; height:auto;"/></div>'
+        #
+        # -----------------------------
+        # [4] 生成 LLM 摘要 (基於 LLM 的結果顯示在右下角)
+        # 以篩選後資料為基礎進行 LLM 摘要，這裡重新設定 Region
+        filtered_df['Region'] = '未定義'
+        filtered_df.loc[(filtered_df['score_sentiment'] > 0) & (filtered_df['score_associate'] > 0), 'Region'] = '政策面正向聲量 (Q1)'
+        filtered_df.loc[(filtered_df['score_sentiment'] < 0) & (filtered_df['score_associate'] > 0), 'Region'] = '政策面負向聲量 (Q2)'
+        filtered_df.loc[(filtered_df['score_sentiment'] < 0) & (filtered_df['score_associate'] < 0), 'Region'] = '金融面負向聲量 (Q3)'
+        filtered_df.loc[(filtered_df['score_sentiment'] > 0) & (filtered_df['score_associate'] < 0), 'Region'] = '金融面正向聲量 (Q4)'
+        
+        Class_list = ['政策面正向聲量 (Q1)', '政策面負向聲量 (Q2)', '金融面負向聲量 (Q3)', '金融面正向聲量 (Q4)']
+        summaries_list = []
+        for region in Class_list:
+            df_region = filtered_df[filtered_df['Region'] == region]
+            print(f"篩選 {region} 的資料筆數: {len(df_region)}")
+            filtered_titles = df_region['Summaries_1'].tolist()
+            # 將清單合併為一個長字串
+            text_input = " ".join(str(s) for s in filtered_titles)
+            print(len(text_input))
+            summary_temp = gpt_summaries(text_input)
+            summaries_list.append(f"{region}: {summary_temp}")
+        summaries_text = "<br><br>".join(summaries_list)
+        summaries_html = f'<div style="width:90%; text-align:left; margin-top:50px; font-size:16px;">{summaries_text}</div>'
+
+        
+        return pie_html, scatter_html,monthly_html, summaries_html
+    except Exception as e:
+        return f"資料加載或生成圖表時出錯: {e}", None, None, None
+
+with gr.Blocks() as demo:
+    # [A] 上方：上傳 + 日期 + 按鈕
+    with gr.Row():
+        with gr.Column():
+            csv_file = gr.File(label="上傳 CSV")
+            start_date = gr.Textbox(value="2024-01-01", label="開始日期 (YYYY-MM-DD)")
+            end_date = gr.Textbox(value="2024-12-31", label="結束日期 (YYYY-MM-DD)")
+            submit_btn = gr.Button("生成圖表")
+    
+ # [B] 上方 (Row 1) 並排顯示 - 左:圓餅圖, 右:散布圖
+    with gr.Row():
+        with gr.Column(scale=1):
+            pie_chart = gr.HTML(label="圓餅圖")
+        with gr.Column(scale=1):
+            scatter_chart = gr.HTML(label="散布圖")
+    
+    # [C] 下方 (Row 2) 整欄顯示「每月統計圖」
+    with gr.Row():
+        with gr.Column(scale=1):
+             monthly_chart = gr.HTML(label="每月統計圖")
+        with gr.Column(scale=1):
+                summaries_output = gr.HTML(label="LLM 摘要")
+    # 按鈕點擊 -> 執行 generate_chart -> 回傳三個輸出
+    submit_btn.click(
+        fn=generate_chart,
+        inputs=[csv_file, start_date, end_date],
+        outputs=[pie_chart, scatter_chart, monthly_chart,summaries_output]
+    )
+
+demo.launch(debug=True)
